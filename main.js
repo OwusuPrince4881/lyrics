@@ -137,7 +137,7 @@ function runPipeline(audioPath, requestId) {
             } else if (parsed.lines) {
               pipelineResult = parsed;
             }
-          } catch (_) {}
+          } catch (_) {} 
         }
       }
     });
