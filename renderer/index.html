@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lyrics Sync</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="drop-overlay" class="drop-overlay glass" aria-hidden="true">
+    <span>Drop to load</span>
+  </div>
+  <div class="shell">
+    <div class="compact-row">
+      <div class="compact-row-inner">
+        <header class="header">
+          <div class="header-left">
+            <h1 class="app-title">Lyrics Sync</h1>
+            <p class="app-subtitle">Drop a song, watch the words follow along.</p>
+          </div>
+        </header>
+      </div>
+    </div>
+
+    <!-- Drop Zone -->
+    <div class="compact-row">
+      <div class="compact-row-inner">
+        <section id="drop-zone" class="drop-zone glass">
+          <div class="drop-zone-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 18V5l12-2v13"></path>
+              <circle cx="6" cy="18" r="3"></circle>
+              <circle cx="18" cy="16" r="3"></circle>
+            </svg>
+          </div>
+          <p class="drop-zone-label">Drop an audio file here</p>
+          <p class="drop-zone-hint">Supports MP3, WAV, FLAC, M4A, OGG, AAC</p>
+        </section>
+      </div>
+    </div>
+
+    <!-- Processing / Progress Card -->
+    <section id="progress-card" class="progress-card glass" hidden>
+      <div class="progress-header">
+        <div class="spinner"></div>
+        <div class="progress-info">
+          <span id="progress-stage" class="progress-stage">Processing</span>
+          <p id="progress-message" class="progress-message">Analyzing audio...</p>
+        </div>
+      </div>
+      <div class="progress-bar-track">
+        <div id="progress-bar-fill" class="progress-bar-fill indeterminate"></div>
+      </div>
+      <button id="cancel-btn" class="btn btn-secondary cancel-btn">Cancel</button>
+    </section>
+
+    <!-- Status Message (for errors/warnings) -->
+    <div id="status" class="status-alert glass" hidden>
+      <span id="status-icon" class="status-icon">⚠️</span>
+      <span id="status-text" class="status-text"></span>
+    </div>
+
+    <!-- Track Header Information -->
+    <div class="compact-row" id="track-info-row">
+      <div class="compact-row-inner">
+        <section id="track-info" class="track-info glass" hidden>
+          <div class="track-details">
+            <div class="track-title-row">
+              <h2 class="track-title" id="track-title">Song Title</h2>
+              <span id="track-badge" class="badge">Matched lyrics</span>
+            </div>
+            <p class="track-artist" id="track-artist">Artist Name</p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Lyrics and empty states share the space above the fixed player -->
+    <section id="lyrics-stage" class="lyrics-stage">
+      <section id="empty-state" class="empty-state glass" hidden>
+        <div class="empty-state-icon">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="8" y1="12" x2="16" y2="12"></line>
+          </svg>
+        </div>
+        <h3 class="empty-state-title">No Lyrics Available</h3>
+        <p class="empty-state-desc">We couldn't find synced lyrics or detect speech in this audio track. Audio playback is still available below.</p>
+      </section>
+
+      <section id="lyrics-panel" class="lyrics-panel" hidden>
+        <div class="lyrics-toolbar">
+          <button id="resume-scroll-btn" class="resume-scroll-pill" hidden>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="7 13 12 18 17 13"></polyline>
+              <polyline points="7 6 12 11 17 6"></polyline>
+            </svg>
+            Resume Auto-scroll
+          </button>
+        </div>
+        <ol id="lyrics-list" class="lyrics-list"></ol>
+      </section>
+    </section>
+
+    <!-- Floating audio player and sync controls -->
+    <footer class="player-dock" id="player-dock">
+      <div class="sync-controls glass" id="sync-offset-controls" aria-label="Lyrics synchronization offset">
+        <button id="sync-toggle-btn" class="sync-toggle-btn" type="button" aria-label="Synchronization controls" aria-controls="sync-offset-controls" title="Synchronization controls">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 7h9m4 0h3M4 17h3m4 0h9"></path>
+            <circle cx="15" cy="7" r="2"></circle>
+            <circle cx="9" cy="17" r="2"></circle>
+          </svg>
+        </button>
+        <button id="sync-back-btn" class="sync-btn" type="button" aria-label="Shift lyrics earlier by 100 milliseconds">−</button>
+        <span id="sync-offset-value" class="sync-offset-value">0 ms</span>
+        <button id="sync-forward-btn" class="sync-btn" type="button" aria-label="Shift lyrics later by 100 milliseconds">+</button>
+        <button id="sync-reset-btn" class="sync-reset-btn" type="button">Reset</button>
+      </div>
+      <div class="player-bar glass" id="player-bar">
+        <button id="player-play-btn" class="player-play-btn glass-button" type="button" aria-label="Play" title="Play" disabled>
+          <svg class="playback-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path class="play-icon" d="M8 5.8c0-.8.9-1.3 1.6-.9l10 6.2a1 1 0 0 1 0 1.7l-10 6.2a1 1 0 0 1-1.6-.9V5.8Z"></path>
+            <path class="pause-icon" d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" hidden></path>
+          </svg>
+        </button>
+        <span id="player-current-time" class="player-time">0:00</span>
+        <label class="player-seek-control" aria-label="Playback position">
+          <input id="player-seek" class="player-range player-seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="Seek audio">
+        </label>
+        <span id="player-duration" class="player-time">0:00</span>
+        <div class="volume-control">
+          <button id="player-mute-btn" class="volume-button" type="button" aria-label="Mute" title="Mute" disabled>
+            <svg class="volume-icon-high" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M11 5 6 9H3v6h3l5 4V5Z"></path>
+              <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"></path>
+            </svg>
+            <svg class="volume-icon-low" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+              <path d="M11 5 6 9H3v6h3l5 4V5Z"></path>
+              <path d="M15.5 8.5a5 5 0 0 1 0 7"></path>
+            </svg>
+            <svg class="volume-icon-muted" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+              <path d="M11 5 6 9H3v6h3l5 4V5Z"></path>
+              <path d="m16 9 5 6m0-6-5 6"></path>
+            </svg>
+          </button>
+          <input id="player-volume" class="player-range player-volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume level" disabled>
+        </div>
+        <audio id="audio-player" preload="metadata" disabled aria-label="Audio playback"></audio>
+      </div>
+    </footer>
+  </div>
+
+  <script src="renderer.js"></script>
+  <script src="player-ui.js"></script>
+</body>
+</html>

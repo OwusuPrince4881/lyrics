@@ -1,0 +1,15 @@
+{
+  "pythonVersion": "3.9",
+  "pythonPlatform": "All",
+  "extraPaths": [
+    "backend"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".cache",
+    "**/__pycache__"
+  ],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "warning"
+}
