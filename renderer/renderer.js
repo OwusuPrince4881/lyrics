@@ -3,6 +3,7 @@ const dropOverlay = document.getElementById('drop-overlay');
 const progressCard = document.getElementById('progress-card');
 const progressStage = document.getElementById('progress-stage');
 const progressMessage = document.getElementById('progress-message');
+const progressBarFill = document.getElementById('progress-bar-fill');
 const cancelBtn = document.getElementById('cancel-btn');
 
 const statusEl = document.getElementById('status');
@@ -84,6 +85,8 @@ function setProcessingState(processing, stageText = 'Analyzing audio…', messag
   dropZone.style.opacity = processing ? '0.6' : '1';
 
   if (processing) {
+    progressBarFill.classList.add('indeterminate');
+    progressBarFill.style.width = '';
     progressStage.textContent = stageText;
     progressMessage.textContent = messageText;
   }
@@ -259,14 +262,30 @@ async function finishSuccessfulResult(result, fileName, filePath, requestId) {
 
   trackTitle.textContent = result.title || fileName;
   trackArtist.textContent = result.artist || 'Unknown Artist';
-  if (result.source === 'plain_estimated') {
-    trackBadge.textContent = 'Estimated timing';
+  const sourceLabels = {
+    embedded: 'Embedded lyrics',
+    sidecar: 'Sidecar lyrics',
+    lrclib: 'LRCLIB lyrics',
+    extra: 'Extra source',
+  };
+  if (result.format === 'estimated' || result.source === 'plain_estimated') {
+    const origin = sourceLabels[result.source];
+    trackBadge.textContent = `Estimated timing${origin ? ` · ${origin}` : ''}`;
     trackBadge.className = 'badge estimated';
+  } else if (result.source === 'embedded' || result.source === 'sidecar' || result.source === 'lrclib') {
+    trackBadge.textContent = sourceLabels[result.source];
+    trackBadge.className = 'badge matched';
+  } else if (result.source === 'extra') {
+    trackBadge.textContent = `Extra source${result.provider ? ` · ${result.provider}` : ''}`;
+    trackBadge.className = 'badge matched';
   } else if (result.format === 'plain' || result.source === 'plain') {
     trackBadge.textContent = `Lyrics (not synced${result.provider ? ` · ${result.provider}` : ''})`;
     trackBadge.className = 'badge transcribed';
-  } else if (result.source === 'lrclib' || result.source === 'syncedlyrics') {
-    trackBadge.textContent = `Matched lyrics${result.provider ? ` · ${result.provider}` : ''}`;
+  } else if (result.source === 'whisper') {
+    trackBadge.textContent = 'Transcribed (may be imperfect)';
+    trackBadge.className = 'badge transcribed';
+  } else if (result.source === 'syncedlyrics') {
+    trackBadge.textContent = `Extra source${result.provider ? ` · ${result.provider}` : ''}`;
     trackBadge.className = 'badge matched';
   } else {
     trackBadge.textContent = 'Transcribed (may be imperfect)';
@@ -314,6 +333,7 @@ window.lyricsApp.onProgress((event) => {
     return;
   }
   if (event.type === 'error') {
+    if (event.error === 'no_lyrics_detected') return;
     finishTerminalError(event.requestId, event.message || event.detail || event.error);
     return;
   }
@@ -326,6 +346,30 @@ window.lyricsApp.onProgress((event) => {
   }
   if (stageKey === 'warning') {
     showStatus(event.message || 'Audio processing reported a warning.');
+  }
+});
+
+window.lyricsApp.onAiPackProgress((event) => {
+  if (!isProcessing) return;
+  progressBarFill.classList.remove('indeterminate');
+  if (event.stage === 'download') {
+    progressStage.textContent = 'Downloading AI pack…';
+    const downloaded = (event.downloadedBytes / 1024 / 1024).toFixed(1);
+    if (event.totalBytes > 0) {
+      progressBarFill.style.width = `${Math.min(100, event.downloadedBytes / event.totalBytes * 100)}%`;
+      progressMessage.textContent = `${downloaded} / ${(event.totalBytes / 1024 / 1024).toFixed(1)} MB`;
+    } else {
+      progressBarFill.style.width = '40%';
+      progressMessage.textContent = `${downloaded} MB downloaded`;
+    }
+  } else if (event.stage === 'extract') {
+    progressStage.textContent = 'Verifying AI pack…';
+    progressMessage.textContent = 'Checking the SHA-256 checksum and unpacking files…';
+    progressBarFill.style.width = '100%';
+  } else if (event.stage === 'complete') {
+    progressStage.textContent = 'Starting transcription…';
+    progressMessage.textContent = 'AI pack installed. Retrying this audio file…';
+    progressBarFill.style.width = '100%';
   }
 });
 
@@ -414,7 +458,26 @@ async function handleAudioFile(file) {
   setProcessingState(true, 'Analyzing audio…', `Loading ${file.name}...`);
 
   try {
-    const response = await window.lyricsApp.processAudio(filePath, requestId);
+    let response = await window.lyricsApp.processAudio(filePath, requestId);
+    if (requestId !== activeProcessingRequestId || resultHandledRequestId === requestId) return;
+    if (response.code === 'no_lyrics_detected') {
+      const packStatus = await window.lyricsApp.getAiPackStatus();
+      const confirmed = packStatus.available &&
+        !packStatus.installed &&
+        typeof window.confirmAiPackDownload === 'function' &&
+        await window.confirmAiPackDownload();
+      if (confirmed) {
+        response = await window.lyricsApp.installAiPack();
+        if (response.ok) {
+          setProcessingState(true, 'Starting transcription…', `Retrying ${file.name} with local AI...`);
+          response = await window.lyricsApp.processAudio(filePath, requestId);
+        }
+      } else if (packStatus.available && !packStatus.installed) {
+        response.error = 'No lyrics found. You can install the optional AI transcription pack later from Settings.';
+      } else if (!packStatus.installed) {
+        response.error = 'No lyrics found. Local AI transcription is not available in this release.';
+      }
+    }
     if (requestId !== activeProcessingRequestId || resultHandledRequestId === requestId) return;
     if (response.ok) {
       await finishSuccessfulResult(response.data, file.name, filePath, requestId);

@@ -1,0 +1,28 @@
+Lyrics Sync third-party notices
+===============================
+
+This file is part of the application distribution. Include the corresponding
+license text and source offer for every binary and Python dependency shipped.
+
+FFmpeg
+------
+No FFmpeg binary is currently included in this repository. Before release, use
+a verified LGPL build of ffmpeg.exe and ffprobe.exe with neither --enable-gpl
+nor --enable-nonfree. Record the exact build version, configuration, source URL,
+SHA-256, license text, and a download location for the corresponding source.
+FFmpeg licensing guidance:
+https://ffmpeg.org/legal.html
+
+Chromaprint fpcalc
+------------------
+No fpcalc binary is currently included in this repository. Before release,
+record the Chromaprint version, source URL, SHA-256, selected FFT backend, and
+the applicable license text. Do not build with a GPL FFT backend if distributing
+under a non-GPL configuration. Project documentation:
+https://github.com/acoustid/chromaprint
+
+Python packages
+---------------
+The frozen backend includes third-party Python packages. Generate and review
+the package license inventory from the exact release environment and include
+the license texts and source links before publishing a release.

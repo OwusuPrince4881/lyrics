@@ -18,6 +18,35 @@
             <h1 class="app-title">Lyrics Sync</h1>
             <p class="app-subtitle">Drop a song, watch the words follow along.</p>
           </div>
+          <div class="settings-menu">
+            <button id="settings-toggle" class="settings-toggle glass-button" type="button" aria-label="Settings" aria-expanded="false" aria-controls="settings-panel" title="Settings">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.7 2.94-.08-.02a1.7 1.7 0 0 0-1.75.5l-.06.07h-3.4l-.03-.09a1.7 1.7 0 0 0-1.39-1.18l-.1-.01-1.7-2.94.06-.07a1.7 1.7 0 0 0 .34-1.88l-.04-.09-1.7-2.94.07-.06a1.7 1.7 0 0 0 .5-1.75l-.02-.08 1.7-2.94.09.02a1.7 1.7 0 0 0 1.75-.5l.06-.07h3.4l.03.09a1.7 1.7 0 0 0 1.39 1.18l.1.01 1.7 2.94-.06.07a1.7 1.7 0 0 0-.34 1.88l.04.09Z"></path>
+              </svg>
+            </button>
+            <section id="settings-panel" class="settings-panel glass" hidden aria-label="Settings">
+              <div class="settings-panel-heading">
+                <h2>Settings</h2>
+                <button id="settings-close" class="panel-close" type="button" aria-label="Close settings">×</button>
+              </div>
+              <label class="setting-toggle">
+                <input id="extra-sources-toggle" type="checkbox">
+                <span>Use extra online lyric sources</span>
+              </label>
+              <p class="settings-note">Uses third-party lyric providers only when LRCLIB has no match.</p>
+              <label class="setting-field" for="acoustid-api-key">Your AcoustID API key (optional)</label>
+              <input id="acoustid-api-key" class="settings-input" type="password" autocomplete="off">
+              <button id="save-acoustid-key" class="btn btn-secondary settings-action" type="button">Save key</button>
+              <p class="settings-note">Your key is stored on this device and takes priority over the app key.</p>
+              <div class="ai-pack-controls">
+                <button id="install-ai-pack" class="btn btn-secondary settings-action" type="button">Install AI transcription pack</button>
+                <progress id="ai-pack-progress" max="100" value="0" hidden></progress>
+                <p id="ai-pack-status" class="settings-note" role="status">Checking transcription pack…</p>
+              </div>
+              <button id="about-open" class="about-open" type="button">About &amp; sources</button>
+            </section>
+          </div>
         </header>
       </div>
     </div>
@@ -151,7 +180,42 @@
     </footer>
   </div>
 
+  <dialog id="extra-sources-confirm" class="confirmation-dialog glass">
+    <h2>Enable extra online sources?</h2>
+    <p>These are third-party sources with their own terms. You are responsible for how you use them and for complying with those terms.</p>
+    <div class="dialog-actions">
+      <button id="extra-sources-cancel" class="btn btn-secondary" type="button">Cancel</button>
+      <button id="extra-sources-confirm-enable" class="btn btn-primary" type="button">Enable sources</button>
+    </div>
+  </dialog>
+
+  <dialog id="ai-pack-confirm" class="confirmation-dialog glass">
+    <h2>Download the AI transcription pack?</h2>
+    <p>This optional, large download enables local transcription. It is installed only after its checksum is verified and stored in your user data folder.</p>
+    <div class="dialog-actions">
+      <button id="ai-pack-cancel" class="btn btn-secondary" type="button">Not now</button>
+      <button id="ai-pack-confirm-download" class="btn btn-primary" type="button">Download pack</button>
+    </div>
+  </dialog>
+
+  <section id="about-screen" class="about-screen" hidden aria-labelledby="about-title">
+    <div class="about-card glass">
+      <button id="about-back" class="panel-close about-back" type="button">← Back</button>
+      <h2 id="about-title">About &amp; sources</h2>
+      <p>Lyrics Sync uses these projects and services:</p>
+      <ul class="source-credits">
+        <li><strong>lrclib</strong> — direct lyric lookup</li>
+        <li><strong>AcoustID and MusicBrainz</strong> — audio identification and recording metadata</li>
+        <li><strong>Chromaprint</strong> — audio fingerprinting</li>
+        <li><strong>Whisper / faster-whisper</strong> — local speech transcription</li>
+        <li><strong>Demucs</strong> — local vocal separation</li>
+      </ul>
+      <p class="lyrics-notice">Lyrics belong to their respective owners. This app does not host lyrics; it retrieves or transcribes them for display on your device.</p>
+    </div>
+  </section>
+
   <script src="renderer.js"></script>
   <script src="player-ui.js"></script>
+  <script src="settings-ui.js"></script>
 </body>
 </html>

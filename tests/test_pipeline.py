@@ -7,9 +7,11 @@ Unit tests for lyrics sync pipeline functions:
 
 import json
 import os
+import sys
 import tempfile
 import pytest
 
+import pipeline
 
 from pipeline import (
     parse_lrc,
@@ -24,6 +26,11 @@ from pipeline import (
     estimate_lyrics_timestamps,
     prepare_lyrics_output,
     read_audio_duration,
+    find_lyrics,
+    read_embedded_lyrics,
+    read_sidecar_lyrics,
+    LYRICS_PROVIDERS,
+    build_user_agent,
 )
 
 
@@ -226,7 +233,7 @@ class TestCaching:
             assert loaded["provider"] == "LRCLIB (direct)"
             assert loaded["lines"] == [{"time": 1.23, "text": "Is this the real life?"}]
             assert loaded["file_hash"] == h1
-            assert loaded["match_version"] == 4
+            assert loaded["match_version"] == 5
 
     def test_cache_miss(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -274,7 +281,7 @@ class TestSyncedLyricsSearch:
                 return self.response(404, {})
             return self.response(200, search_results)
 
-        monkeypatch.setattr("pipeline._search_syncedlyrics", lambda _query: (None, "syncedlyrics"))
+        monkeypatch.setattr("pipeline._search_syncedlyrics", lambda _query, **_kwargs: (None, "syncedlyrics"))
         monkeypatch.setattr("pipeline.requests.get", fake_get)
         result = fetch_synced_lyrics("Track", "Artist", 200)
         assert result is not None
@@ -293,7 +300,7 @@ class TestSyncedLyricsSearch:
                 return self.response(404, {})
             return self.response(200, search_results)
 
-        monkeypatch.setattr("pipeline._search_syncedlyrics", lambda _query: (None, "syncedlyrics"))
+        monkeypatch.setattr("pipeline._search_syncedlyrics", lambda _query, **_kwargs: (None, "syncedlyrics"))
         monkeypatch.setattr("pipeline.requests.get", fake_get)
         monkeypatch.setattr("pipeline.emit_event", lambda event_type, **kwargs: events.append((event_type, kwargs)))
 
@@ -317,8 +324,9 @@ class TestSyncedLyricsSearch:
     def test_search_uses_query_variants_in_order_and_reports_provider(self, monkeypatch):
         queries = []
 
-        def fake_search(query, *, allow_plain_format):
+        def fake_search(query, *, allow_plain_format, providers):
             assert allow_plain_format is True
+            assert providers == ["Musixmatch", "NetEase", "Megalobiz", "Genius"]
             queries.append(query)
             if len(queries) == 1:
                 return None
@@ -331,13 +339,14 @@ class TestSyncedLyricsSearch:
         monkeypatch.setattr("pipeline.syncedlyrics.search", fake_search)
         monkeypatch.setattr(
             "pipeline._fetch_lrclib_lyrics",
-            lambda *_args: pytest.fail("Direct LRCLIB should not run after synced lyrics are found"),
+            lambda *_args: None,
         )
 
         result = fetch_synced_lyrics(
             "Song Title (2019 Remaster) feat. Guest Artist",
             "Main Artist",
             180,
+            enabled_providers=["lrclib", "extra"],
         )
 
         assert queries == [
@@ -347,7 +356,7 @@ class TestSyncedLyricsSearch:
         assert result is not None
         assert result.format == "synced"
         assert result.provider == "Musixmatch"
-        assert result.source == "syncedlyrics"
+        assert result.source == "extra"
         assert result.text == "[00:01.00]A lyric"
 
     def test_distinctive_title_adds_title_only_search_after_artist_query(self, monkeypatch):
@@ -363,18 +372,18 @@ class TestSyncedLyricsSearch:
     def test_plain_lyrics_are_preserved_when_direct_lrclib_has_no_match(self, monkeypatch):
         monkeypatch.setattr(
             "pipeline._search_syncedlyrics",
-            lambda _query: (
+            lambda _query, **_kwargs: (
                 "First plain lyric\nSecond plain lyric",
                 "Genius",
             ),
         )
         monkeypatch.setattr("pipeline._fetch_lrclib_lyrics", lambda *_args: None)
 
-        result = fetch_synced_lyrics("Track", "Artist", 200)
+        result = fetch_synced_lyrics("Track", "Artist", 200, enabled_providers=["lrclib", "extra"])
 
         assert result is not None
         assert result.format == "plain"
-        assert result.source == "syncedlyrics"
+        assert result.source == "extra"
         assert result.provider == "Genius"
         assert result.text == "First plain lyric\nSecond plain lyric"
 
@@ -414,7 +423,7 @@ class TestSyncedLyricsSearch:
             {"time": 60.0, "text": "Second plain lyric"},
             {"time": 120.0, "text": "Third plain lyric"},
         ]
-        assert source == "plain_estimated"
+        assert source == "syncedlyrics"
         assert lyrics_format == "estimated"
 
     def test_plain_lyrics_use_file_duration_not_identified_track_duration(self, monkeypatch):
@@ -434,7 +443,7 @@ class TestSyncedLyricsSearch:
 
         assert [line["time"] for line in lines] == [0.0, 80.58, 161.17]
         assert lines[-1]["time"] < audio_file_duration
-        assert source == "plain_estimated"
+        assert source == "syncedlyrics"
 
     def test_plain_lyrics_remain_available_when_audio_duration_is_unavailable(self, monkeypatch):
         monkeypatch.setattr("pipeline.read_audio_duration", lambda _path: None)
@@ -448,7 +457,7 @@ class TestSyncedLyricsSearch:
         lines, source, lyrics_format = prepare_lyrics_output(result, "track.mp3")
 
         assert lines == [{"text": "Line one"}, {"text": "Line two"}]
-        assert source == "plain"
+        assert source == "syncedlyrics"
         assert lyrics_format == "plain"
 
     def test_audio_duration_falls_back_to_ffprobe(self, monkeypatch):
@@ -475,17 +484,190 @@ class TestSyncedLyricsSearch:
     def test_direct_lrclib_synced_result_takes_precedence_over_plain_fallback(self, monkeypatch):
         monkeypatch.setattr(
             "pipeline._search_syncedlyrics",
-            lambda _query: ("Plain lyrics", "Genius"),
+            lambda _query, **_kwargs: ("Plain lyrics", "Genius"),
         )
         monkeypatch.setattr(
             "pipeline._fetch_lrclib_lyrics",
             lambda *_args: "[00:01.00]Timed lyrics",
         )
 
-        result = fetch_synced_lyrics("Track", "Artist", 200)
+        result = fetch_synced_lyrics("Track", "Artist", 200, enabled_providers=["lrclib", "extra"])
 
         assert result is not None
         assert result.format == "synced"
         assert result.source == "lrclib"
         assert result.provider == "LRCLIB (direct)"
         assert result.text == "[00:01.00]Timed lyrics"
+
+    def test_lrclib_rate_limit_returns_control_to_fallback(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(
+            "pipeline.requests.get",
+            lambda *_args, **_kwargs: type("Response", (), {"status_code": 429})(),
+        )
+        monkeypatch.setattr(
+            "pipeline.emit_event",
+            lambda event_type, **kwargs: events.append((event_type, kwargs)),
+        )
+
+        assert pipeline._fetch_lrclib_lyrics("Unknown Track", None, None) is None
+        assert any(
+            event_type == "progress" and data.get("stage") == "warning"
+            for event_type, data in events
+        )
+
+
+class TestProviderOrder:
+    def test_registry_defaults_and_lrclib_user_agent(self):
+        assert pipeline.enabled_provider_ids() == [
+            "embedded", "sidecar", "lrclib", "whisper"
+        ]
+        assert next(provider for provider in LYRICS_PROVIDERS if provider["id"] == "extra")[
+            "enabled_by_default"
+        ] is False
+        assert build_user_agent("Lyrics Sync", "2.3.4") == (
+            "Lyrics Sync/2.3.4 (TODO: Replace with the public project URL)"
+        )
+
+    def test_embedded_and_sidecar_readers(self, monkeypatch, tmp_path):
+        audio_path = tmp_path / "embedded.mp3"
+        audio_path.write_bytes(b"audio")
+        monkeypatch.setattr(
+            "pipeline._mutagen_lyrics_text",
+            lambda _path: "[00:01.00]embedded test lyric",
+        )
+        embedded = read_embedded_lyrics(str(audio_path))
+        assert embedded is not None
+        assert embedded.source == "embedded"
+        assert embedded.format == "synced"
+
+        audio_path = tmp_path / "sidecar.mp3"
+        audio_path.write_bytes(b"audio")
+        (tmp_path / "sidecar.lrc").write_text(
+            "[00:02.00]sidecar test lyric\n", encoding="utf-8"
+        )
+        sidecar = read_sidecar_lyrics(str(audio_path))
+        assert sidecar is not None
+        assert sidecar.source == "sidecar"
+        assert sidecar.provider == "Sidecar .lrc"
+
+    def test_three_song_provider_trace(self, monkeypatch, tmp_path):
+        song_paths = {}
+        for name in ("embedded-song", "sidecar-song", "transcribed-song"):
+            path = tmp_path / f"{name}.mp3"
+            path.write_bytes(f"synthetic audio {name}".encode("utf-8"))
+            song_paths[name] = str(path)
+        (tmp_path / "sidecar-song.lrc").write_text(
+            "[00:02.00]sidecar test lyric\n", encoding="utf-8"
+        )
+
+        lyric_tags = {
+            song_paths["embedded-song"]: "[00:01.00]embedded test lyric",
+            song_paths["sidecar-song"]: None,
+            song_paths["transcribed-song"]: None,
+        }
+        monkeypatch.setattr(
+            "pipeline._mutagen_lyrics_text",
+            lambda path: lyric_tags[path],
+        )
+        monkeypatch.setattr(
+            "pipeline.extract_audio_tags",
+            lambda path: {
+                "title": os.path.splitext(os.path.basename(path))[0],
+                "artist": "Test Artist",
+                "duration": 12,
+            },
+        )
+        monkeypatch.setattr("pipeline._fetch_lrclib_lyrics", lambda *_args: None)
+        monkeypatch.setattr(
+            "pipeline.check_tool_availability",
+            lambda: {"ffmpeg": True, "fpcalc": False},
+        )
+        monkeypatch.setattr("pipeline.identify_song_acoustid", lambda *_args: None)
+        monkeypatch.setattr("pipeline.separate_vocals", lambda audio, _workdir: audio)
+        monkeypatch.setattr(
+            "pipeline.transcribe",
+            lambda _audio, model_size, model_dir: [{"time": 0.0, "text": model_size}],
+        )
+
+        traces = {}
+        for name, audio_path in song_paths.items():
+            events = []
+            monkeypatch.setattr(
+                "pipeline.emit_event",
+                lambda event_type, _events=events, **kwargs: _events.append((event_type, kwargs)),
+            )
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "pipeline.py",
+                    audio_path,
+                    "--cache-dir",
+                    str(tmp_path / "user-data-cache"),
+                ],
+            )
+            pipeline.main()
+            traces[name] = [
+                data["provider"]
+                for event_type, data in events
+                if event_type == "progress" and data.get("stage") == "provider"
+            ]
+
+        assert traces == {
+            "embedded-song": ["embedded"],
+            "sidecar-song": ["embedded", "sidecar"],
+            "transcribed-song": ["embedded", "sidecar", "lrclib", "whisper"],
+        }
+
+    def test_filename_is_used_for_lrclib_after_tags_do_not_match(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        audio_path = tmp_path / "Artist - Filename Title.mp3"
+        audio_path.write_bytes(b"synthetic audio")
+        searched = []
+        result = LyricsSearchResult(
+            "[00:01.00]Lyrics from filename search",
+            "synced",
+            "LRCLIB (direct)",
+            "lrclib",
+        )
+        monkeypatch.setattr("pipeline._mutagen_lyrics_text", lambda _path: None)
+        monkeypatch.setattr("pipeline.extract_audio_tags", lambda _path: None)
+        monkeypatch.setattr(
+            "pipeline.check_tool_availability",
+            lambda: {"ffmpeg": False, "fpcalc": False},
+        )
+        monkeypatch.setattr("pipeline.identify_song_acoustid", lambda *_args: None)
+        monkeypatch.setattr("pipeline.read_audio_duration", lambda _path: 10)
+
+        def find_by_title(title, artist, duration, providers):
+            searched.append((title, artist, duration, providers))
+            return result if title == "Artist - Filename Title" else None
+
+        monkeypatch.setattr("pipeline.fetch_synced_lyrics", find_by_title)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "pipeline.py",
+                str(audio_path),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--enabled-providers",
+                "embedded",
+                "sidecar",
+                "lrclib",
+            ],
+        )
+
+        pipeline.main()
+
+        assert searched == [
+            ("Artist - Filename Title", None, 10, ["embedded", "sidecar", "lrclib"])
+        ]
+        result_data = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert result_data["title"] == "Artist - Filename Title"
+        assert result_data["lines"] == [
+            {"time": 1.0, "text": "Lyrics from filename search"}
+        ]

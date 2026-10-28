@@ -70,10 +70,20 @@ def test_fallback_when_acoustid_api_key_unset():
         temp_path = f.name
 
     try:
-        proc = run_pipeline_raw([temp_path], env_override={"ACOUSTID_API_KEY": ""})
+        proc = run_pipeline_raw(
+            [
+                "--offline",
+                temp_path,
+                "--enabled-providers",
+                "embedded",
+                "sidecar",
+                "lrclib",
+            ],
+            env_override={"ACOUSTID_API_KEY": ""},
+        )
         # Should NOT crash with unhandled exception or KeyError
         assert "Traceback" not in proc.stderr
-        # Should emit AcoustID not configured progress event
+        # Should emit AcoustID not configured progress event without network calls.
         assert "ACOUSTID_API_KEY not configured" in proc.stdout
     finally:
         if os.path.exists(temp_path):
@@ -89,7 +99,10 @@ def test_failure_missing_ffmpeg():
     try:
         # Override PATH with minimal path excluding ffmpeg
         clean_path = "C:\\Windows\\System32;C:\\Windows"
-        proc = run_pipeline_raw([temp_path], env_override={"PATH": clean_path, "ACOUSTID_API_KEY": ""})
+        proc = run_pipeline_raw(
+            ["--offline", temp_path],
+            env_override={"PATH": clean_path, "ACOUSTID_API_KEY": ""},
+        )
         assert proc.returncode != 0
         found_missing_dep = False
         for line in proc.stdout.splitlines():

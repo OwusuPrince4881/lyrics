@@ -2,15 +2,9 @@
 """
 Lyrics Sync Desktop - Pipeline
 
-Turns an audio file into timestamped lyric lines.
-
-Pipeline Flow:
-1. Validate audio input and check tool dependencies (ffmpeg, fpcalc).
-2. Check local .cache/ for previously processed results using SHA-256 file hash.
-3. Path A: Identify track via AcoustID fingerprint or embedded audio tags (ID3/Vorbis/MP4).
-   If track metadata is found, search syncedlyrics providers and direct LRCLIB.
-4. Path B (Fallback): Demucs vocal stem isolation -> faster-whisper word-level transcription.
-5. Save successful result to local .cache/ for instant re-runs.
+Turns an audio file into timestamped lyric lines. Providers run in this order:
+embedded tags, same-name sidecar, direct LRCLIB, opt-in extra online sources,
+and finally local Whisper transcription.
 
 Communication Protocol:
 Emits structured JSON events to stdout prefixed with '__LYRICS_EVENT__ ':
@@ -41,12 +35,31 @@ import syncedlyrics
 
 ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY")
 LRCLIB_BASE = "https://lrclib.net/api"
-UA_HEADERS = {"User-Agent": "LyricsSyncDesktop/0.2 (personal project)"}
-LYRICS_MATCH_VERSION = 4
-LYRICS_CACHE_SOURCES = {"lrclib", "syncedlyrics", "plain", "plain_estimated"}
+PROJECT_URL = "TODO: Replace with the public project URL"
+UA_HEADERS = {"User-Agent": f"Lyrics Sync/0.1.0 ({PROJECT_URL})"}
+LYRICS_MATCH_VERSION = 5
+LYRICS_CACHE_SOURCES = {
+    "embedded", "sidecar", "lrclib", "extra", "whisper", "plain",
+    "plain_estimated", "syncedlyrics",
+}
+LYRICS_PROVIDERS = (
+    {"id": "embedded", "label": "Embedded audio lyrics", "enabled_by_default": True},
+    {"id": "sidecar", "label": "Sidecar lyrics", "enabled_by_default": True},
+    {"id": "lrclib", "label": "LRCLIB", "enabled_by_default": True},
+    {"id": "extra", "label": "Extra online sources", "enabled_by_default": False},
+    {"id": "whisper", "label": "Local Whisper transcription", "enabled_by_default": True},
+)
+EXTRA_LYRIC_SOURCES = ["Musixmatch", "NetEase", "Megalobiz", "Genius"]
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CACHE_DIR = os.path.join(PROJECT_ROOT, ".cache")
+CACHE_DIR = os.environ.get(
+    "LYRICS_CACHE_DIR",
+    os.path.join(os.path.expanduser("~"), ".lyrics-sync", "lyrics-cache"),
+)
+MODEL_DIR = os.environ.get(
+    "LYRICS_MODEL_DIR",
+    os.path.join(os.path.expanduser("~"), ".lyrics-sync", "models"),
+)
 _LRC_TIMESTAMP_PATTERN = re.compile(r"\[\d+:\d+(?:\.\d+)?\]")
 _FEATURE_SUFFIX_PATTERN = re.compile(r"\s+(?:feat\.?|ft\.?)\s+.+$", re.IGNORECASE)
 _ANNOTATION_PATTERN = re.compile(r"\s*[\(\[].*?[\)\]]")
@@ -140,9 +153,35 @@ def prepare_lyrics_output(
 
     duration = read_audio_duration(audio_path)
     if duration is None:
-        return lines, "plain", "plain"
+        return lines, result.source, "plain"
     estimated_lines = estimate_lyrics_timestamps(lines, duration)
-    return estimated_lines, "plain_estimated", "estimated"
+    return estimated_lines, result.source, "estimated"
+
+
+def enabled_provider_ids(requested: Optional[List[str]] = None) -> List[str]:
+    """Returns valid providers in registry order, defaulting to enabled entries."""
+    known_ids = {provider["id"] for provider in LYRICS_PROVIDERS}
+    if requested is None:
+        requested = [
+            provider["id"]
+            for provider in LYRICS_PROVIDERS
+            if provider["enabled_by_default"]
+        ]
+    unknown_ids = set(requested) - known_ids
+    if unknown_ids:
+        raise ValueError(f"Unknown lyric provider(s): {', '.join(sorted(unknown_ids))}")
+    return [provider["id"] for provider in LYRICS_PROVIDERS if provider["id"] in requested]
+
+
+def provider_attempt(provider_id: str) -> None:
+    provider = next(provider for provider in LYRICS_PROVIDERS if provider["id"] == provider_id)
+    emit_event(
+        "progress",
+        stage="provider",
+        provider=provider_id,
+        label=provider["label"],
+        message=f"Trying {provider['label']}...",
+    )
 
 
 def emit_event(event_type: str, **kwargs: Any) -> None:
@@ -237,6 +276,86 @@ def extract_audio_tags(audio_path: str) -> Optional[Dict[str, Any]]:
         pass
     except Exception:
         pass
+    return None
+
+
+def _mutagen_lyrics_text(audio_path: str) -> Optional[str]:
+    """Reads common unsynchronized lyric tags without modifying the audio file."""
+    try:
+        import mutagen
+    except ImportError:
+        emit_event(
+            "progress",
+            stage="warning",
+            message="mutagen is not installed; embedded lyrics cannot be read.",
+        )
+        return None
+
+    try:
+        audio = mutagen.File(audio_path, easy=False)
+    except Exception as exc:
+        emit_event("progress", stage="warning", message=f"Could not read embedded lyrics: {exc}")
+        return None
+    if audio is None or audio.tags is None:
+        return None
+
+    tags = audio.tags
+    for frame in tags.getall("SYLT") if hasattr(tags, "getall") else []:
+        entries = getattr(frame, "text", None)
+        if entries:
+            lines = []
+            for text, timestamp in entries:
+                total_seconds = float(timestamp) / 1000.0
+                minutes = int(total_seconds // 60)
+                seconds = total_seconds - minutes * 60
+                lines.append(f"[{minutes:02d}:{seconds:05.2f}]{text}")
+            if lines:
+                return "\n".join(lines)
+
+    for frame in tags.getall("USLT") if hasattr(tags, "getall") else []:
+        text = getattr(frame, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    for key in ("LYRICS", "lyrics", "UNSYNCEDLYRICS", "unsyncedlyrics", "\xa9lyr", "©lyr"):
+        try:
+            value = tags.get(key)
+        except AttributeError:
+            value = None
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def read_embedded_lyrics(audio_path: str) -> Optional[LyricsSearchResult]:
+    text = _mutagen_lyrics_text(audio_path)
+    if not text:
+        return None
+    lyrics_format = "synced" if _LRC_TIMESTAMP_PATTERN.search(text) else "plain"
+    return LyricsSearchResult(text, lyrics_format, "Embedded audio tags", "embedded")
+
+
+def read_sidecar_lyrics(audio_path: str) -> Optional[LyricsSearchResult]:
+    base_path = os.path.splitext(audio_path)[0]
+    for extension in (".lrc", ".txt"):
+        sidecar_path = base_path + extension
+        if not os.path.isfile(sidecar_path):
+            continue
+        try:
+            with open(sidecar_path, "r", encoding="utf-8-sig") as sidecar:
+                text = sidecar.read().strip()
+        except OSError as exc:
+            emit_event(
+                "progress",
+                stage="warning",
+                message=f"Could not read sidecar lyrics at {sidecar_path}: {exc}",
+            )
+            continue
+        if text:
+            lyrics_format = "synced" if extension == ".lrc" and _LRC_TIMESTAMP_PATTERN.search(text) else "plain"
+            return LyricsSearchResult(text, lyrics_format, f"Sidecar {extension}", "sidecar")
     return None
 
 
@@ -335,21 +454,31 @@ def _clean_lyrics_title(title: str) -> str:
     return " ".join(cleaned.split())
 
 
-def _lyrics_search_queries(title: str, artist: Optional[str]) -> List[str]:
+def _lyrics_search_query_variants(
+    title: str, artist: Optional[str]
+) -> List[tuple[str, Optional[str]]]:
     cleaned_title = _clean_lyrics_title(title)
     query_titles = [title, cleaned_title]
     if len(cleaned_title.split()) > 3:
         query_titles.append(cleaned_title)
 
-    queries: List[str] = []
+    variants: List[tuple[str, Optional[str]]] = []
     for query_title in query_titles:
-        query = " ".join(part for part in (query_title.strip(), (artist or "").strip()) if part)
-        if query and query not in queries:
-            queries.append(query)
+        variant = (query_title.strip(), artist.strip() if artist else None)
+        if variant[0] and variant not in variants:
+            variants.append(variant)
 
-    if len(cleaned_title.split()) > 3 and cleaned_title not in queries:
-        queries.append(cleaned_title)
-    return queries
+    title_only = (cleaned_title, None)
+    if len(cleaned_title.split()) > 3 and title_only not in variants:
+        variants.append(title_only)
+    return variants
+
+
+def _lyrics_search_queries(title: str, artist: Optional[str]) -> List[str]:
+    return [
+        " ".join(part for part in (query_title, query_artist or "") if part)
+        for query_title, query_artist in _lyrics_search_query_variants(title, artist)
+    ]
 
 
 class _SyncedLyricsProviderCapture(logging.Handler):
@@ -368,7 +497,9 @@ class _SyncedLyricsProviderCapture(logging.Handler):
             self.plain_provider = plain_match.group(1)
 
 
-def _search_syncedlyrics(query: str) -> tuple[Optional[str], str]:
+def _search_syncedlyrics(
+    query: str, *, providers: Optional[List[str]] = None
+) -> tuple[Optional[str], str]:
     logger = logging.getLogger("syncedlyrics")
     capture = _SyncedLyricsProviderCapture()
     previous_level = logger.level
@@ -376,8 +507,21 @@ def _search_syncedlyrics(query: str) -> tuple[Optional[str], str]:
     logger.addHandler(capture)
     try:
         search_options: Dict[str, Any] = {}
-        if "allow_plain_format" in inspect.signature(syncedlyrics.search).parameters:
+        search_signature = inspect.signature(syncedlyrics.search)
+        if "allow_plain_format" in search_signature.parameters:
             search_options["allow_plain_format"] = True
+        if providers is not None:
+            if "providers" not in search_signature.parameters:
+                emit_event(
+                    "progress",
+                    stage="warning",
+                    message=(
+                        "The installed syncedlyrics version cannot restrict extra "
+                        "sources to the configured providers; skipping them."
+                    ),
+                )
+                return None, "syncedlyrics"
+            search_options["providers"] = providers
         lyrics = syncedlyrics.search(query, **search_options)
     finally:
         logger.removeHandler(capture)
@@ -407,12 +551,19 @@ def _fetch_lrclib_lyrics(
     # 1. Exact match endpoint
     try:
         r = requests.get(f"{LRCLIB_BASE}/get", params=params, headers=UA_HEADERS, timeout=8)
+        if r.status_code == 429:
+            emit_event(
+                "progress",
+                stage="warning",
+                message="LRCLIB rate-limited this lookup; trying the filename and local lyric sources.",
+            )
+            return None
         if r.status_code == 200:
             data = r.json()
             if data.get("syncedLyrics"):
                 return data["syncedLyrics"]
-    except requests.RequestException:
-        pass
+    except requests.RequestException as exc:
+        emit_event("progress", stage="warning", message=f"LRCLIB lookup failed: {exc}")
 
     # 2. Fuzzy search endpoint
     search_params = {"track_name": title}
@@ -421,6 +572,13 @@ def _fetch_lrclib_lyrics(
 
     try:
         r = requests.get(f"{LRCLIB_BASE}/search", params=search_params, headers=UA_HEADERS, timeout=8)
+        if r.status_code == 429:
+            emit_event(
+                "progress",
+                stage="warning",
+                message="LRCLIB rate-limited this search; trying local lyric sources.",
+            )
+            return None
         if r.status_code == 200:
             results = r.json()
             if isinstance(results, list):
@@ -454,48 +612,96 @@ def _fetch_lrclib_lyrics(
                         result_artist and artist.casefold() in result_artist.casefold()
                     ):
                         return item["syncedLyrics"]
-    except requests.RequestException:
-        pass
+    except requests.RequestException as exc:
+        emit_event("progress", stage="warning", message=f"LRCLIB search failed: {exc}")
 
     return None
 
 
 def fetch_synced_lyrics(
-    title: str, artist: Optional[str], duration: Optional[int]
+    title: str,
+    artist: Optional[str],
+    duration: Optional[int],
+    enabled_providers: Optional[List[str]] = None,
 ) -> Optional[LyricsSearchResult]:
-    """Searches aggregate lyrics providers first, then LRCLIB directly."""
+    """Searches direct LRCLIB first, followed by explicitly enabled extra sources."""
+    providers_enabled = set(enabled_provider_ids(enabled_providers))
     plain_result: Optional[LyricsSearchResult] = None
-    for query in _lyrics_search_queries(title, artist):
-        emit_event("progress", stage="lyrics", message=f"Searching lyrics for '{query}'...")
-        lyrics, provider = _search_syncedlyrics(query)
-        if lyrics is None:
-            continue
+    if "lrclib" in providers_enabled:
+        provider_attempt("lrclib")
+        for query_title, query_artist in _lyrics_search_query_variants(title, artist):
+            query = " ".join(part for part in (query_title, query_artist or "") if part)
+            emit_event("progress", stage="lrclib", message=f"Searching lrclib.net for '{query}'...")
+            direct_lyrics = _fetch_lrclib_lyrics(query_title, query_artist, duration)
+            if direct_lyrics:
+                return LyricsSearchResult(
+                    direct_lyrics,
+                    "synced",
+                    "LRCLIB (direct)",
+                    "lrclib",
+                )
 
-        lyrics_format = "synced" if _LRC_TIMESTAMP_PATTERN.search(lyrics) else "plain"
-        source = "syncedlyrics"
-        candidate = LyricsSearchResult(lyrics, lyrics_format, provider, source)
-        if lyrics_format == "synced":
-            return candidate
-        plain_result = candidate
-        break
-
-    emit_event("progress", stage="lrclib", message="Searching lrclib.net directly...")
-    direct_lyrics = _fetch_lrclib_lyrics(title, artist, duration)
-    if direct_lyrics:
-        return LyricsSearchResult(
-            direct_lyrics,
-            "synced",
-            "LRCLIB (direct)",
-            "lrclib",
-        )
+    if "extra" in providers_enabled:
+        provider_attempt("extra")
+        for query in _lyrics_search_queries(title, artist):
+            emit_event("progress", stage="lyrics", message=f"Searching extra sources for '{query}'...")
+            lyrics, provider = _search_syncedlyrics(query, providers=EXTRA_LYRIC_SOURCES)
+            if lyrics is None:
+                continue
+            lyrics_format = "synced" if _LRC_TIMESTAMP_PATTERN.search(lyrics) else "plain"
+            candidate = LyricsSearchResult(lyrics, lyrics_format, provider, "extra")
+            if lyrics_format == "synced":
+                return candidate
+            plain_result = candidate
     return plain_result
+
+
+def find_lyrics(
+    audio_path: str,
+    title: str,
+    artist: Optional[str],
+    duration: Optional[int],
+    enabled_providers: Optional[List[str]] = None,
+) -> Optional[LyricsSearchResult]:
+    """Runs file-local providers before online sources in registry order."""
+    local_result = find_local_lyrics(audio_path, enabled_providers)
+    if local_result:
+        return local_result
+    return fetch_synced_lyrics(title, artist, duration, enabled_providers)
+
+
+def find_local_lyrics(
+    audio_path: str, enabled_providers: Optional[List[str]] = None
+) -> Optional[LyricsSearchResult]:
+    """Runs embedded-tag and same-name sidecar providers in registry order."""
+    providers_enabled = set(enabled_provider_ids(enabled_providers))
+    for provider_id, reader in (
+        ("embedded", read_embedded_lyrics),
+        ("sidecar", read_sidecar_lyrics),
+    ):
+        if provider_id not in providers_enabled:
+            continue
+        provider_attempt(provider_id)
+        result = reader(audio_path)
+        if result:
+            return result
+    return None
+
+
+def build_user_agent(app_name: str, app_version: str) -> str:
+    return f"{app_name}/{app_version} ({PROJECT_URL})"
 
 
 def separate_vocals(audio_path: str, workdir: str) -> str:
     """Runs Demucs to isolate vocals. Returns the path to the vocals stem."""
     emit_event("progress", stage="demucs", message="Separating vocals from background music (Demucs)...")
 
-    cmd = [sys.executable, "-m", "demucs", "--two-stems", "vocals", "-o", workdir, audio_path]
+    demucs_executable = os.environ.get("DEMUX_EXECUTABLE")
+    cmd = (
+        [demucs_executable, "--run-demucs", "--two-stems", "vocals", "-o", workdir, audio_path]
+        if demucs_executable
+        else [sys.executable, "-m", "demucs", "--two-stems", "vocals", "-o", workdir, audio_path]
+    )
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         # Fallback to direct demucs CLI if module call failed
@@ -577,8 +783,11 @@ def group_words_into_lines(
     return lines
 
 
-def transcribe(audio_path: str, model_size: str = "small") -> List[Dict[str, Any]]:
+def transcribe(
+    audio_path: str, model_size: str = "small", model_dir: str = MODEL_DIR
+) -> List[Dict[str, Any]]:
     """Transcribes audio with word-level timestamps using faster-whisper."""
+    os.makedirs(model_dir, exist_ok=True)
     emit_event("progress", stage="whisper", message=f"Transcribing vocals with faster-whisper ({model_size})...")
 
     try:
@@ -591,10 +800,14 @@ def transcribe(audio_path: str, model_size: str = "small") -> List[Dict[str, Any
 
     compute_type = "int8"
     try:
-        model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
+        model = WhisperModel(
+            model_size, device="cpu", compute_type=compute_type, download_root=model_dir
+        )
     except Exception:
         try:
-            model = WhisperModel(model_size, device="cpu", compute_type="float32")
+            model = WhisperModel(
+                model_size, device="cpu", compute_type="float32", download_root=model_dir
+            )
         except Exception as exc:
             fail("transcription_failed", f"Failed to initialize Whisper model '{model_size}': {str(exc)}")
 
@@ -696,12 +909,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Lyrics Sync Audio Pipeline")
     parser.add_argument("audio_path", help="Path to input audio file")
     parser.add_argument(
+        "--enabled-providers",
+        nargs="*",
+        default=None,
+        help="Ordered provider IDs enabled for this run",
+    )
+    parser.add_argument("--cache-dir", default=CACHE_DIR, help="User-local lyrics cache directory")
+    parser.add_argument("--model-dir", default=MODEL_DIR, help="User-local AI model directory")
+    parser.add_argument(
+        "--offline", action="store_true", help="Skip AcoustID and online lyric lookups"
+    )
+    parser.add_argument("--app-name", default="Lyrics Sync", help="Application name for LRCLIB etiquette")
+    parser.add_argument("--app-version", default="0.1.0", help="Application version for LRCLIB etiquette")
+    parser.add_argument(
         "--model",
         default="small",
         choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
         help="faster-whisper model size (default: small)",
     )
     args = parser.parse_args()
+
+    global UA_HEADERS
+    try:
+        providers_enabled = enabled_provider_ids(args.enabled_providers)
+    except ValueError as exc:
+        fail("invalid_provider", str(exc))
+    UA_HEADERS = {"User-Agent": build_user_agent(args.app_name, args.app_version)}
 
     audio_path = os.path.abspath(args.audio_path)
     if not os.path.exists(audio_path):
@@ -713,7 +946,7 @@ def main() -> None:
     # Check local cache first
     try:
         file_hash = compute_file_hash(audio_path)
-        cached_result = load_cached_lyrics(file_hash)
+        cached_result = load_cached_lyrics(file_hash, cache_dir=args.cache_dir)
         if cached_result:
             emit_event("progress", stage="cache", message="Loaded cached lyrics for this track.")
             emit_event(
@@ -732,23 +965,51 @@ def main() -> None:
         emit_event("progress", stage="warning", message=f"Cache lookup failed: {str(exc)}")
 
     emit_event("progress", stage="init", message="Validating audio file and environment...")
+
+    # File-local lyric providers run before any online lookup or transcription.
+    local_result = find_local_lyrics(audio_path, providers_enabled)
+    song_info = extract_audio_tags(audio_path)
+    if local_result:
+        lines, source, lyrics_format = prepare_lyrics_output(local_result, audio_path)
+        result_payload = {
+            "source": source,
+            "title": (song_info or {}).get("title") or os.path.splitext(os.path.basename(audio_path))[0],
+            "artist": (song_info or {}).get("artist"),
+            "format": lyrics_format,
+            "provider": local_result.provider,
+            "lines": lines,
+        }
+        if file_hash:
+            save_cached_lyrics(file_hash, result_payload, cache_dir=args.cache_dir)
+        emit_event("result", **result_payload)
+        print(json.dumps(result_payload), flush=True)
+        return
+
     tools = check_tool_availability()
 
-    # 1. Try AcoustID Identification
-    song_info = identify_song_acoustid(audio_path, tools)
-
-    # 2. Fallback to Embedded Audio Tags (ID3 / Vorbis / MP4)
+    # AcoustID is only used to identify a track when embedded metadata is absent.
+    if not song_info and not args.offline:
+        song_info = identify_song_acoustid(audio_path, tools)
+    elif not song_info and args.offline:
+        if not ACOUSTID_API_KEY:
+            identify_song_acoustid(audio_path, tools)
+        else:
+            emit_event(
+                "progress",
+                stage="fingerprint",
+                message="AcoustID lookup skipped in offline mode; checking audio tags.",
+            )
     if not song_info:
         emit_event("progress", stage="tags", message="Reading audio tags from file...")
         song_info = extract_audio_tags(audio_path)
 
-    # 3. If track metadata was found, search aggregated providers and LRCLIB.
-    if song_info and song_info.get("title"):
+    # Direct LRCLIB precedes explicitly enabled extra providers.
+    if song_info and song_info.get("title") and not args.offline:
         title = song_info["title"]
         artist = song_info.get("artist")
         duration = song_info.get("duration")
 
-        lyric_result = fetch_synced_lyrics(title, artist, duration)
+        lyric_result = fetch_synced_lyrics(title, artist, duration, providers_enabled)
         if lyric_result:
             lines, source, lyrics_format = prepare_lyrics_output(
                 lyric_result, audio_path
@@ -763,12 +1024,50 @@ def main() -> None:
                     "lines": lines,
                 }
                 if file_hash:
-                    save_cached_lyrics(file_hash, result_payload)
+                    save_cached_lyrics(file_hash, result_payload, cache_dir=args.cache_dir)
                 emit_event("result", **result_payload)
                 print(json.dumps(result_payload), flush=True)
                 return
 
-    # 4. Fallback AI Pipeline: Vocal Isolation + Whisper Transcription
+    filename_title = os.path.splitext(os.path.basename(audio_path))[0].strip()
+    tag_title = str((song_info or {}).get("title") or "").strip()
+    if (
+        filename_title
+        and not args.offline
+        and "lrclib" in providers_enabled
+        and filename_title.casefold() != tag_title.casefold()
+    ):
+        emit_event(
+            "progress",
+            stage="lrclib",
+            message=f"Searching LRCLIB using the filename '{filename_title}'...",
+        )
+        lyric_result = fetch_synced_lyrics(
+            filename_title, None, read_audio_duration(audio_path), providers_enabled
+        )
+        if lyric_result:
+            lines, source, lyrics_format = prepare_lyrics_output(
+                lyric_result, audio_path
+            )
+            if lines:
+                result_payload = {
+                    "source": source,
+                    "title": filename_title,
+                    "artist": None,
+                    "format": lyrics_format,
+                    "provider": lyric_result.provider,
+                    "lines": lines,
+                }
+                if file_hash:
+                    save_cached_lyrics(file_hash, result_payload, cache_dir=args.cache_dir)
+                emit_event("result", **result_payload)
+                print(json.dumps(result_payload), flush=True)
+                return
+
+    if "whisper" not in providers_enabled:
+        fail("no_lyrics_detected", "No lyrics were found by the enabled lyric providers.")
+
+    provider_attempt("whisper")
     if not tools["ffmpeg"]:
         fail(
             "missing_dependency",
@@ -794,7 +1093,7 @@ def main() -> None:
             )
             vocals_path = audio_path
 
-        lines = transcribe(vocals_path, model_size=args.model)
+        lines = transcribe(vocals_path, model_size=args.model, model_dir=args.model_dir)
 
     if not lines:
         fail("no_lyrics_detected", "No lyrics or vocal phrases were detected in this audio file.")
@@ -803,15 +1102,22 @@ def main() -> None:
         "source": "whisper",
         "title": fallback_title,
         "artist": fallback_artist,
+        "format": "transcribed",
         "lines": lines,
     }
 
     if file_hash:
-        save_cached_lyrics(file_hash, final_result)
+        save_cached_lyrics(file_hash, final_result, cache_dir=args.cache_dir)
 
     emit_event("result", **final_result)
     print(json.dumps(final_result), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--run-demucs":
+        from demucs.separate import main as demucs_main
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        demucs_main()
+    else:
+        main()

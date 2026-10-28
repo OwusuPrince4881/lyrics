@@ -1,6 +1,12 @@
 node_modules/
 dist/
 .cache/
+.build/
+.packaging-venv/
+.packaging-ai-venv/
+backend/dist/
+build/staging/
+build/ai-pack/
 .pytest_cache/
 __pycache__/
 *.pyc

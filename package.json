@@ -8,7 +8,9 @@
     "dev": "electron .",
     "test": "python -m pytest tests/ -v",
     "dist": "electron-builder",
-    "dist:win": "electron-builder --win",
+    "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-backend.ps1",
+    "build:ai-pack": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-ai-pack.ps1",
+    "dist:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\package-win.ps1",
     "dist:mac": "electron-builder --mac",
     "dist:linux": "electron-builder --linux"
   },
@@ -40,14 +42,30 @@
 
     "extraResources": [
       {
-        "from": "backend",
+        "from": "backend\\dist\\lyrics-pipeline",
         "to": "backend",
-        "filter": [
-          "**/*.py",
-          "requirements.txt",
-          "!**/__pycache__/**",
-          "!**/*.pyc"
-        ]
+        "filter": ["**/*"]
+      },
+      {
+        "from": "backend\\pipeline.py",
+        "to": "backend\\pipeline.py"
+      },
+      {
+        "from": "resources\\windows-x64\\bin",
+        "to": "bin",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "build\\staging\\app-config.json",
+        "to": "app-config.json"
+      },
+      {
+        "from": "scripts\\extract-ai-pack.ps1",
+        "to": "scripts\\extract-ai-pack.ps1"
+      },
+      {
+        "from": "THIRD_PARTY_LICENSES",
+        "to": "THIRD_PARTY_LICENSES"
       }
     ],
 
@@ -55,10 +73,7 @@
     "asarUnpack": [],
 
     "win": {
-      "target": [
-        { "target": "nsis",     "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
-      ],
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
       "icon": "build/icon.ico"
     },
     "nsis": {
