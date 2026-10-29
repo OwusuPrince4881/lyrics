@@ -63,8 +63,7 @@ def test_failure_empty_audio_file():
             os.remove(temp_path)
 
 
-def test_fallback_when_acoustid_api_key_unset():
-    # When ACOUSTID_API_KEY is not set, it should emit progress and fall back gracefully
+def test_offline_mode_skips_acoustid_with_friendly_status():
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         f.write(b"ID3\x03\x00\x00dummy audio content for test")
         temp_path = f.name
@@ -83,8 +82,7 @@ def test_fallback_when_acoustid_api_key_unset():
         )
         # Should NOT crash with unhandled exception or KeyError
         assert "Traceback" not in proc.stderr
-        # Should emit AcoustID not configured progress event without network calls.
-        assert "ACOUSTID_API_KEY not configured" in proc.stdout
+        assert "Couldn't identify by fingerprint, searching by tags instead" in proc.stdout
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)

@@ -7,6 +7,7 @@ dist/
 backend/dist/
 build/staging/
 build/ai-pack/
+vendor/release-assets/
 .pytest_cache/
 __pycache__/
 *.pyc

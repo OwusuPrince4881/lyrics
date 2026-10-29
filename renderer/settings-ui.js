@@ -191,7 +191,9 @@ window.lyricsApp.getAiPackStatus().then((status) => {
     installAiPackButton.textContent = 'AI pack installed';
   } else if (!status.available) {
     aiPackAvailable = false;
-    aiPackStatus.textContent = 'AI transcription pack is not available in this build.';
+    aiPackStatus.textContent = status.error
+      ? `AI-pack test source is unavailable: ${status.error}`
+      : 'AI transcription pack is not available in this build.';
     installAiPackButton.disabled = true;
   } else {
     aiPackAvailable = true;

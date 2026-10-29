@@ -671,3 +671,147 @@ class TestProviderOrder:
         assert result_data["lines"] == [
             {"time": 1.0, "text": "Lyrics from filename search"}
         ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "429",
+        "503",
+        pipeline.requests.Timeout("timeout"),
+        pipeline.requests.ConnectionError("connection failed"),
+    ],
+)
+def test_acoustid_retries_transient_failures_then_falls_back(
+    monkeypatch, failure
+):
+    calls = []
+    delays = []
+
+    def fake_post(*_args, **_kwargs):
+        calls.append(True)
+        if isinstance(failure, Exception):
+            raise failure
+
+        class FakeResponse:
+            status_code = int(failure)
+
+        return FakeResponse()
+
+    monkeypatch.setattr(pipeline.requests, "post", fake_post)
+    monkeypatch.setattr(pipeline, "_throttle_acoustid_request", lambda: None)
+    monkeypatch.setattr(pipeline.time, "sleep", delays.append)
+
+    assert pipeline._request_acoustid_lookup("fingerprint", 60) is None
+    assert len(calls) == 3
+    assert delays == [1, 3]
+
+
+def test_acoustid_retries_then_returns_success(monkeypatch):
+    calls = []
+    delays = []
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "ok", "results": []}
+
+    def fake_post(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            response = FakeResponse()
+            response.status_code = 503
+            return response
+        return FakeResponse()
+
+    monkeypatch.setattr(pipeline.requests, "post", fake_post)
+    monkeypatch.setattr(pipeline, "_throttle_acoustid_request", lambda: None)
+    monkeypatch.setattr(pipeline.time, "sleep", delays.append)
+
+    assert pipeline._request_acoustid_lookup("fingerprint", 60) == {
+        "status": "ok",
+        "results": [],
+    }
+    assert len(calls) == 2
+    assert delays == [1]
+
+
+def test_acoustid_throttle_enforces_interval_with_jitter(monkeypatch):
+    clock = [10.0]
+    delays = []
+    monkeypatch.setattr(pipeline, "_last_acoustid_request_at", 0.0)
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(pipeline.random, "uniform", lambda _start, _end: 0.1)
+
+    def fake_sleep(delay):
+        delays.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(pipeline.time, "sleep", fake_sleep)
+    pipeline._throttle_acoustid_request()
+    pipeline._throttle_acoustid_request()
+
+    assert delays == pytest.approx([1.1])
+    assert clock[0] >= 11.1
+
+
+@pytest.mark.parametrize("result", [None, {"title": "Track", "artist": "Artist"}])
+def test_acoustid_cache_roundtrip_and_expiry(monkeypatch, tmp_path, result):
+    file_hash = "a" * 64
+    now = [1_000_000.0]
+    monkeypatch.setattr(pipeline.time, "time", lambda: now[0])
+    pipeline._save_acoustid_cache(file_hash, result, str(tmp_path))
+
+    assert pipeline._load_acoustid_cache(file_hash, str(tmp_path)) == (True, result)
+
+    now[0] += pipeline.ACOUSTID_CACHE_TTL_SECONDS + 1
+    assert pipeline._load_acoustid_cache(file_hash, str(tmp_path)) == (False, None)
+
+
+def test_tag_lyrics_success_skips_acoustid(monkeypatch, tmp_path, capsys):
+    audio_path = tmp_path / "Known track.mp3"
+    audio_path.write_bytes(b"synthetic audio")
+    lyric_result = LyricsSearchResult(
+        "[00:01.00]Lyrics from tags",
+        "synced",
+        "LRCLIB (direct)",
+        "lrclib",
+    )
+    calls = []
+    monkeypatch.setattr("pipeline._mutagen_lyrics_text", lambda _path: None)
+    monkeypatch.setattr(
+        "pipeline.extract_audio_tags",
+        lambda _path: {
+            "title": "Known track",
+            "artist": "Known artist",
+            "duration": 120,
+        },
+    )
+    monkeypatch.setattr(
+        "pipeline.fetch_synced_lyrics",
+        lambda title, artist, *_args: (
+            calls.append((title, artist)) or lyric_result
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.identify_song_acoustid",
+        lambda *_args: pytest.fail("AcoustID should be skipped when tag lyrics are found"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pipeline.py",
+            str(audio_path),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    pipeline.main()
+
+    assert calls == [("Known track", "Known artist")]
+    result_data = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result_data["title"] == "Known track"

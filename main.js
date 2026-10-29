@@ -17,6 +17,12 @@ const AI_PACK_DIR = path.join(app.getPath('userData'), 'ai-pack');
 const AI_BACKEND = path.join(AI_PACK_DIR, 'worker', 'lyrics-ai-worker', 'lyrics-ai-worker.exe');
 const APP_CONFIG_PATH = path.join(process.resourcesPath, 'app-config.json');
 const PACKAGED_WINDOWS = app.isPackaged && process.platform === 'win32';
+const DEV_AI_PACK_TEST_FILE = !app.isPackaged &&
+  process.platform === 'win32' &&
+  typeof process.env.LYRICS_AI_PACK_TEST_FILE === 'string' &&
+  process.env.LYRICS_AI_PACK_TEST_FILE.trim()
+  ? path.resolve(process.env.LYRICS_AI_PACK_TEST_FILE.trim())
+  : null;
 
 function readBuildConfig() {
   if (!app.isPackaged) return {};
@@ -99,6 +105,71 @@ function isAiPackInstalled() {
   return fs.existsSync(AI_BACKEND);
 }
 
+function getAiPackConfig() {
+  if (PACKAGED_WINDOWS) {
+    return {
+      url: buildConfig.aiPackUrl,
+      sha256: buildConfig.aiPackSha256
+    };
+  }
+  if (!DEV_AI_PACK_TEST_FILE) return null;
+
+  try {
+    const checksumPath = `${DEV_AI_PACK_TEST_FILE}.sha256`;
+    const sha256 = fs.readFileSync(checksumPath, 'utf8').trim().split(/\s+/)[0];
+    return { localPath: DEV_AI_PACK_TEST_FILE, sha256 };
+  } catch (error) {
+    return {
+      localPath: DEV_AI_PACK_TEST_FILE,
+      error: `Could not read the local AI pack checksum: ${error.message}`
+    };
+  }
+}
+
+function isAiPackConfigAvailable(config) {
+  if (!config || typeof config.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(config.sha256)) {
+    return false;
+  }
+  if (typeof config.localPath === 'string') {
+    return fs.existsSync(config.localPath) && fs.statSync(config.localPath).isFile();
+  }
+  return typeof config.url === 'string' && config.url.startsWith('https://');
+}
+
+function copyLocalFile(source, destination, onProgress) {
+  return new Promise((resolve, reject) => {
+    let totalBytes;
+    try {
+      const sourceStat = fs.statSync(source);
+      if (!sourceStat.isFile()) {
+        reject(new Error('The local AI pack test path is not a file.'));
+        return;
+      }
+      totalBytes = sourceStat.size;
+    } catch (error) {
+      reject(new Error(`Could not read the local AI pack test file: ${error.message}`));
+      return;
+    }
+
+    let downloadedBytes = 0;
+    const input = fs.createReadStream(source);
+    const output = fs.createWriteStream(destination, { flags: 'wx' });
+    const fail = (error) => {
+      input.destroy();
+      output.destroy();
+      reject(error);
+    };
+    input.on('data', (chunk) => {
+      downloadedBytes += chunk.length;
+      onProgress({ downloadedBytes, totalBytes });
+    });
+    input.on('error', fail);
+    output.on('error', fail);
+    output.on('finish', resolve);
+    input.pipe(output);
+  });
+}
+
 function downloadHttpsFile(url, destination, onProgress, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     if (redirectCount > 5) {
@@ -161,7 +232,8 @@ function hashFile(filePath) {
 
 function extractAiPack(archivePath, destinationDir) {
   return new Promise((resolve, reject) => {
-    const scriptPath = path.join(process.resourcesPath, 'scripts', 'extract-ai-pack.ps1');
+    const scriptRoot = PACKAGED_WINDOWS ? process.resourcesPath : __dirname;
+    const scriptPath = path.join(scriptRoot, 'scripts', 'extract-ai-pack.ps1');
     const powershellPath = path.join(
       process.env.SystemRoot || 'C:\\Windows',
       'System32',
@@ -188,18 +260,19 @@ function extractAiPack(archivePath, destinationDir) {
 }
 
 async function installAiPack(sender) {
-  if (!PACKAGED_WINDOWS) {
-    throw new Error('The AI transcription pack is currently available only for packaged Windows builds.');
+  if (process.platform !== 'win32' || (app.isPackaged && !PACKAGED_WINDOWS)) {
+    throw new Error('The AI transcription pack is currently available only on Windows.');
   }
   if (isAiPackInstalled()) return { alreadyInstalled: true };
   if (aiPackInstallPromise) return aiPackInstallPromise;
 
-  const { aiPackUrl, aiPackSha256 } = buildConfig;
-  if (typeof aiPackUrl !== 'string' ||
-      !aiPackUrl.startsWith('https://') ||
-      typeof aiPackSha256 !== 'string' ||
-      !/^[a-f0-9]{64}$/i.test(aiPackSha256)) {
-    throw new Error('The AI transcription pack is not configured for this release.');
+  const aiPackConfig = getAiPackConfig();
+  if (!isAiPackConfigAvailable(aiPackConfig)) {
+    throw new Error(
+      aiPackConfig && aiPackConfig.error
+        ? aiPackConfig.error
+        : 'The AI transcription pack is not configured for this build.'
+    );
   }
 
   aiPackInstallPromise = (async () => {
@@ -214,12 +287,17 @@ async function installAiPack(sender) {
     try {
       fs.mkdirSync(userDataDir, { recursive: true });
       sendProgress({ stage: 'download', downloadedBytes: 0, totalBytes: 0 });
-      await downloadHttpsFile(aiPackUrl, archivePath, (data) => {
+      const reportProgress = (data) => {
         sendProgress({ stage: 'download', ...data });
-      });
+      };
+      if (aiPackConfig.localPath) {
+        await copyLocalFile(aiPackConfig.localPath, archivePath, reportProgress);
+      } else {
+        await downloadHttpsFile(aiPackConfig.url, archivePath, reportProgress);
+      }
 
       const digest = await hashFile(archivePath);
-      if (digest.toLowerCase() !== aiPackSha256.toLowerCase()) {
+      if (digest.toLowerCase() !== aiPackConfig.sha256.toLowerCase()) {
         throw new Error('AI pack checksum verification failed; the downloaded file was rejected.');
       }
 
@@ -291,12 +369,13 @@ async function runPipeline(audioPath, requestId) {
   const settings = readAppSettings();
   const enabledProviders = ['embedded', 'sidecar', 'lrclib'];
   if (settings.extraOnlineSourcesEnabled) enabledProviders.push('extra');
-  const aiPackInstalled = PACKAGED_WINDOWS && fs.existsSync(AI_BACKEND);
+  const aiPackInstalled = process.platform === 'win32' && isAiPackInstalled();
   if (aiPackInstalled) enabledProviders.push('whisper');
+  const useFrozenBackend = PACKAGED_WINDOWS || aiPackInstalled;
   const executable = PACKAGED_WINDOWS
     ? (aiPackInstalled ? AI_BACKEND : DEFAULT_BACKEND)
-    : PYTHON_BIN;
-  const args = PACKAGED_WINDOWS
+    : aiPackInstalled ? AI_BACKEND : PYTHON_BIN;
+  const args = useFrozenBackend
     ? [audioPath]
     : [PIPELINE_SCRIPT, audioPath];
   const userDataDir = app.getPath('userData');
@@ -447,14 +526,14 @@ ipcMain.handle('save-settings', (_event, settings) => {
   }
 });
 
-ipcMain.handle('get-ai-pack-status', () => ({
-  installed: isAiPackInstalled(),
-  available: PACKAGED_WINDOWS &&
-    typeof buildConfig.aiPackUrl === 'string' &&
-    buildConfig.aiPackUrl.startsWith('https://') &&
-    typeof buildConfig.aiPackSha256 === 'string' &&
-    /^[a-f0-9]{64}$/i.test(buildConfig.aiPackSha256)
-}));
+ipcMain.handle('get-ai-pack-status', () => {
+  const config = getAiPackConfig();
+  return {
+    installed: isAiPackInstalled(),
+    available: isAiPackConfigAvailable(config),
+    error: config && config.error
+  };
+});
 
 ipcMain.handle('install-ai-pack', async (event) => {
   try {

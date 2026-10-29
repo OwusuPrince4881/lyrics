@@ -6,20 +6,81 @@ license text and source offer for every binary and Python dependency shipped.
 
 FFmpeg
 ------
-No FFmpeg binary is currently included in this repository. Before release, use
-a verified LGPL build of ffmpeg.exe and ffprobe.exe with neither --enable-gpl
-nor --enable-nonfree. Record the exact build version, configuration, source URL,
-SHA-256, license text, and a download location for the corresponding source.
+No FFmpeg binary is currently included in this repository. The intended
+candidate, provided by the release owner, is the BtbN Windows x86_64 LGPL
+shared build `ffmpeg-n9.0.1-9-gfa97c9f046-win64-lgpl-shared-9.0.zip` from:
+https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-27-16-45
+Build repository: https://github.com/BtbN/FFmpeg-Builds
+FFmpeg n9.0.1 source tag: https://github.com/FFmpeg/FFmpeg/tree/n9.0.1
+
+The proposed BtbN release-tag URL currently returns 404 (checked 2026-10-28).
+The repository's release page lists an n9.0 LGPL-shared archive under a moving
+`latest` URL, which is not an acceptable release input. Do not use that asset;
+wait for a valid immutable release URL or a locally supplied archive. For the
+selected archive, record its exact version and SHA-256 cross-checked against
+that release's checksums.sha256, the `ffmpeg -version` configuration line,
+whether `--enable-version3` is present, and the LICENSE text from the archive.
+Confirm that neither `--enable-gpl` nor `--enable-nonfree` is present. Bundle
+ffmpeg.exe, ffprobe.exe, and all required DLLs. Preserve the verified ZIP in
+the ignored local `vendor/release-assets` directory; builds must not download
+from a moving URL.
 FFmpeg licensing guidance:
 https://ffmpeg.org/legal.html
 
 Chromaprint fpcalc
 ------------------
-No fpcalc binary is currently included in this repository. Before release,
-record the Chromaprint version, source URL, SHA-256, selected FFT backend, and
-the applicable license text. Do not build with a GPL FFT backend if distributing
-under a non-GPL configuration. Project documentation:
-https://github.com/acoustid/chromaprint
+No fpcalc binary is currently included in this repository. The intended
+upstream release is Chromaprint v1.5.1:
+https://github.com/acoustid/chromaprint/releases/tag/v1.5.1
+Windows x86_64 archive:
+https://github.com/acoustid/chromaprint/releases/download/v1.5.1/chromaprint-fpcalc-1.5.1-windows-x86_64.zip
+Source tag: https://github.com/acoustid/chromaprint/tree/v1.5.1
+License text: https://github.com/acoustid/chromaprint/blob/v1.5.1/LICENSE.md
+
+The archive has not yet been supplied for verification. Before release, record
+the archive SHA-256 and include the exact upstream LICENSE.md text. The release
+owner reports that the FFT backend is FFmpeg-based rather than FFTW3; this
+remains unverified from the binary itself. Preserve the verified ZIP in the
+ignored local `vendor/release-assets` directory; builds must not download from a
+moving URL.
+
+Chromaprint v1.5.1 upstream LICENSE.md
+--------------------------------------
+Chromaprint's own source code is licensed under the MIT license, but we include
+some parts of the FFmpeg library, which is licensed under the LGPL 2.1 license.
+
+As a whole, Chromaprint should therefore be considered to be licensed under
+the LGPL 2.1 license. We are hoping to remove the included FFmpeg code and make
+MIT the only license used in the project.
+
+Note that when distributing Chromaprint in binary form, you should also take
+into consideration the license of the external FFT library that you compile
+Chromaprint with.
+
+MIT License
+
+Copyright (C) 2010-2016 Lukas Lalinsky
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The upstream LICENSE.md links to the full GNU LGPL 2.1 text:
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.en.html
 
 Python packages
 ---------------

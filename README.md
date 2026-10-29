@@ -164,6 +164,23 @@ their model weights on first transcription into the user-data model directory.
 The installer and pack are large; measure the actual release artifacts before
 publishing any download-size estimate.
 
+The AI-pack build writes a `.sha256` file next to the ZIP. To exercise the
+download, checksum, and extraction flow during Windows development without
+hosting the ZIP, set `LYRICS_AI_PACK_TEST_FILE` to that local ZIP path and run
+`npm start`:
+
+```powershell
+$env:LYRICS_AI_PACK_TEST_FILE = (Resolve-Path .\build\ai-pack\lyrics-ai-pack-win-x64.zip).Path
+npm start
+```
+
+The app uses the adjacent `.sha256` file as the expected checksum, copies the
+archive through the same verification and extraction flow, and installs it
+under the development user's app-data directory. This override is ignored by
+packaged builds. When `LYRICS_AI_PACK_URL` is unset, the staged packaged
+manifest contains a clearly marked TODO URL and no checksum, so the AI-pack
+download remains unavailable until release configuration is supplied.
+
 Automatic application updates are not configured. They can be added later with
 signed versioned releases and a secure update feed; update-signing credentials
 must remain in the release environment.

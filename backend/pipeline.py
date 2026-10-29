@@ -2,9 +2,9 @@
 """
 Lyrics Sync Desktop - Pipeline
 
-Turns an audio file into timestamped lyric lines. Providers run in this order:
-embedded tags, same-name sidecar, direct LRCLIB, opt-in extra online sources,
-and finally local Whisper transcription.
+Turns an audio file into timestamped lyric lines. Embedded lyrics and sidecars
+run first; tag-based lyric lookup precedes AcoustID fallback, then filename
+lookup and local Whisper transcription.
 
 Communication Protocol:
 Emits structured JSON events to stdout prefixed with '__LYRICS_EVENT__ ':
@@ -22,18 +22,29 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
 import syncedlyrics
+from acoustid_constants import ACOUSTID_APPLICATION_KEY, ACOUSTID_CONTACT_EMAIL
 
-ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY")
+ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY") or ACOUSTID_APPLICATION_KEY
+ACOUSTID_LOOKUP_URL = "https://api.acoustid.org/v2/lookup"
+ACOUSTID_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+ACOUSTID_REQUEST_INTERVAL_SECONDS = 1.0
+ACOUSTID_REQUEST_JITTER_SECONDS = 0.2
+ACOUSTID_REQUEST_TIMEOUT = (3, 5)
+ACOUSTID_FINGERPRINT_TIMEOUT_SECONDS = 30
+ACOUSTID_RETRY_DELAYS_SECONDS = (1, 3)
+_last_acoustid_request_at = 0.0
 LRCLIB_BASE = "https://lrclib.net/api"
 PROJECT_URL = "TODO: Replace with the public project URL"
 UA_HEADERS = {"User-Agent": f"Lyrics Sync/0.1.0 ({PROJECT_URL})"}
@@ -359,49 +370,206 @@ def read_sidecar_lyrics(audio_path: str) -> Optional[LyricsSearchResult]:
     return None
 
 
-def identify_song_acoustid(audio_path: str, tools: Dict[str, bool]) -> Optional[Dict[str, Any]]:
+def _acoustid_cache_path(file_hash: str, cache_dir: str) -> str:
+    return os.path.join(cache_dir, "acoustid", f"{file_hash}.json")
+
+
+def _load_acoustid_cache(
+    file_hash: Optional[str], cache_dir: str
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    if not file_hash:
+        return False, None
+    try:
+        with open(_acoustid_cache_path(file_hash, cache_dir), "r", encoding="utf-8") as cache_file:
+            cached = json.load(cache_file)
+        cached_at = float(cached["cached_at"])
+        if time.time() - cached_at > ACOUSTID_CACHE_TTL_SECONDS:
+            return False, None
+        result = cached.get("result")
+        if result is None or isinstance(result, dict):
+            return True, result
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return False, None
+
+
+def _save_acoustid_cache(
+    file_hash: Optional[str], result: Optional[Dict[str, Any]], cache_dir: str
+) -> None:
+    if not file_hash:
+        return
+    cache_path = _acoustid_cache_path(file_hash, cache_dir)
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as cache_file:
+            json.dump({"cached_at": time.time(), "result": result}, cache_file)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Could not save AcoustID cache: %s", exc)
+
+
+def _throttle_acoustid_request() -> None:
+    global _last_acoustid_request_at
+    now = time.monotonic()
+    interval = ACOUSTID_REQUEST_INTERVAL_SECONDS + random.uniform(
+        0, ACOUSTID_REQUEST_JITTER_SECONDS
+    )
+    delay = interval - (now - _last_acoustid_request_at)
+    if delay > 0:
+        time.sleep(delay)
+    _last_acoustid_request_at = time.monotonic()
+
+
+def _request_acoustid_lookup(
+    fingerprint: str, duration: float
+) -> Optional[Dict[str, Any]]:
+    headers = {
+        "User-Agent": (
+            f"Lyrics Sync/0.1.0 (mailto:{ACOUSTID_CONTACT_EMAIL})"
+        )
+    }
+    data = {
+        "client": ACOUSTID_API_KEY,
+        "duration": int(duration),
+        "fingerprint": fingerprint,
+        "meta": "recordings",
+        "format": "json",
+    }
+    for attempt in range(len(ACOUSTID_RETRY_DELAYS_SECONDS) + 1):
+        _throttle_acoustid_request()
+        try:
+            response = requests.post(
+                ACOUSTID_LOOKUP_URL,
+                data=data,
+                headers=headers,
+                timeout=ACOUSTID_REQUEST_TIMEOUT,
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt < len(ACOUSTID_RETRY_DELAYS_SECONDS):
+                time.sleep(ACOUSTID_RETRY_DELAYS_SECONDS[attempt])
+                continue
+            logging.getLogger(__name__).info("AcoustID is unavailable: %s", exc)
+            return None
+        except requests.RequestException as exc:
+            logging.getLogger(__name__).info("AcoustID lookup failed: %s", exc)
+            return None
+
+        if response.status_code in (429, 503):
+            if attempt < len(ACOUSTID_RETRY_DELAYS_SECONDS):
+                time.sleep(ACOUSTID_RETRY_DELAYS_SECONDS[attempt])
+                continue
+            return None
+        if response.status_code != 200:
+            logging.getLogger(__name__).info(
+                "AcoustID lookup returned HTTP %s", response.status_code
+            )
+            return None
+        try:
+            payload = response.json()
+        except (ValueError, requests.RequestException) as exc:
+            logging.getLogger(__name__).info("Invalid AcoustID response: %s", exc)
+            return None
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            return None
+        return payload
+    return None
+
+
+def identify_song_acoustid(
+    audio_path: str,
+    tools: Dict[str, bool],
+    file_hash: Optional[str] = None,
+    cache_dir: str = CACHE_DIR,
+) -> Optional[Dict[str, Any]]:
     """Fingerprints file and looks up track on AcoustID."""
+    cache_hit, cached_result = _load_acoustid_cache(file_hash, cache_dir)
+    if cache_hit:
+        if cached_result is None:
+            emit_event(
+                "progress",
+                stage="fingerprint",
+                message="Couldn't identify by fingerprint, searching by tags instead",
+            )
+        return cached_result
+
     if not ACOUSTID_API_KEY:
-        emit_event("progress", stage="fingerprint", message="ACOUSTID_API_KEY not configured. Checking audio tags...")
+        emit_event(
+            "progress",
+            stage="fingerprint",
+            message="Couldn't identify by fingerprint, searching by tags instead",
+        )
         return None
 
     if not tools.get("fpcalc"):
-        emit_event("progress", stage="fingerprint", message="fpcalc binary not found on PATH. Checking audio tags...")
+        emit_event(
+            "progress",
+            stage="fingerprint",
+            message="Couldn't identify by fingerprint, searching by tags instead",
+        )
         return None
 
     try:
-        import acoustid
-    except ImportError:
-        emit_event("progress", stage="fingerprint", message="pyacoustid library not installed. Checking audio tags...")
-        return None
-
-    try:
-        emit_event("progress", stage="fingerprint", message="Fingerprinting audio with AcoustID...")
-        duration, fingerprint = acoustid.fingerprint_file(audio_path)
-        response = acoustid.lookup(ACOUSTID_API_KEY, fingerprint, duration, meta="recordings")
+        emit_event("progress", stage="fingerprint", message="Fingerprinting audio...")
+        fpcalc = shutil.which("fpcalc")
+        if not fpcalc:
+            raise FileNotFoundError("fpcalc binary not found on PATH")
+        fingerprint_result = subprocess.run(
+            [fpcalc, "-length", "120", audio_path],
+            capture_output=True,
+            text=True,
+            timeout=ACOUSTID_FINGERPRINT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if fingerprint_result.returncode != 0:
+            raise RuntimeError("fpcalc could not fingerprint this audio file")
+        fingerprint_values = {}
+        for line in fingerprint_result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                fingerprint_values[key] = value
+        duration = float(fingerprint_values["DURATION"])
+        fingerprint = fingerprint_values["FINGERPRINT"]
     except Exception as exc:
-        emit_event("progress", stage="fingerprint", message=f"AcoustID lookup failed: {str(exc)}")
+        logging.getLogger(__name__).info("Could not fingerprint audio: %s", exc)
+        emit_event(
+            "progress",
+            stage="fingerprint",
+            message="Couldn't identify by fingerprint, searching by tags instead",
+        )
+        return None
+
+    response = _request_acoustid_lookup(fingerprint, duration)
+    if response is None:
+        emit_event(
+            "progress",
+            stage="fingerprint",
+            message="Couldn't identify by fingerprint, searching by tags instead",
+        )
         return None
 
     results = response.get("results") or []
     if not results:
+        _save_acoustid_cache(file_hash, None, cache_dir)
         return None
 
     best = max(results, key=lambda r: r.get("score", 0))
     if best.get("score", 0) < 0.5:
+        _save_acoustid_cache(file_hash, None, cache_dir)
         return None
 
     recordings = best.get("recordings") or []
     if not recordings or not recordings[0].get("title"):
+        _save_acoustid_cache(file_hash, None, cache_dir)
         return None
 
     rec = recordings[0]
     artists = rec.get("artists") or []
-    return {
+    result = {
         "title": rec["title"],
         "artist": artists[0]["name"] if artists else None,
         "duration": round(duration),
     }
+    _save_acoustid_cache(file_hash, result, cache_dir)
+    return result
 
 
 def parse_lrc(lrc_text: str) -> List[Dict[str, Any]]:
@@ -968,6 +1136,7 @@ def main() -> None:
 
     # File-local lyric providers run before any online lookup or transcription.
     local_result = find_local_lyrics(audio_path, providers_enabled)
+    emit_event("progress", stage="tags", message="Reading audio tags...")
     song_info = extract_audio_tags(audio_path)
     if local_result:
         lines, source, lyrics_format = prepare_lyrics_output(local_result, audio_path)
@@ -987,29 +1156,15 @@ def main() -> None:
 
     tools = check_tool_availability()
 
-    # AcoustID is only used to identify a track when embedded metadata is absent.
-    if not song_info and not args.offline:
-        song_info = identify_song_acoustid(audio_path, tools)
-    elif not song_info and args.offline:
-        if not ACOUSTID_API_KEY:
-            identify_song_acoustid(audio_path, tools)
-        else:
-            emit_event(
-                "progress",
-                stage="fingerprint",
-                message="AcoustID lookup skipped in offline mode; checking audio tags.",
-            )
-    if not song_info:
-        emit_event("progress", stage="tags", message="Reading audio tags from file...")
-        song_info = extract_audio_tags(audio_path)
-
-    # Direct LRCLIB precedes explicitly enabled extra providers.
-    if song_info and song_info.get("title") and not args.offline:
-        title = song_info["title"]
-        artist = song_info.get("artist")
-        duration = song_info.get("duration")
-
-        lyric_result = fetch_synced_lyrics(title, artist, duration, providers_enabled)
+    def try_lyrics_for_track(track_info: Optional[Dict[str, Any]]) -> bool:
+        if not track_info or not track_info.get("title") or args.offline:
+            return False
+        title = track_info["title"]
+        artist = track_info.get("artist")
+        duration = track_info.get("duration")
+        lyric_result = fetch_synced_lyrics(
+            title, artist, duration, providers_enabled
+        )
         if lyric_result:
             lines, source, lyrics_format = prepare_lyrics_output(
                 lyric_result, audio_path
@@ -1027,7 +1182,36 @@ def main() -> None:
                     save_cached_lyrics(file_hash, result_payload, cache_dir=args.cache_dir)
                 emit_event("result", **result_payload)
                 print(json.dumps(result_payload), flush=True)
+                return True
+        return False
+
+    # Use embedded tags first; fingerprint only if their lyric search fails.
+    if try_lyrics_for_track(song_info):
+        return
+
+    if args.offline:
+        emit_event(
+            "progress",
+            stage="fingerprint",
+            message="Couldn't identify by fingerprint, searching by tags instead",
+        )
+    else:
+        identified_info = identify_song_acoustid(
+            audio_path, tools, file_hash, args.cache_dir
+        )
+        if identified_info:
+            tags_match = bool(
+                song_info
+                and song_info.get("title")
+                and song_info.get("artist")
+                and song_info["title"].casefold()
+                == identified_info["title"].casefold()
+                and (song_info.get("artist") or "").casefold()
+                == (identified_info.get("artist") or "").casefold()
+            )
+            if not tags_match and try_lyrics_for_track(identified_info):
                 return
+            song_info = identified_info
 
     filename_title = os.path.splitext(os.path.basename(audio_path))[0].strip()
     tag_title = str((song_info or {}).get("title") or "").strip()
